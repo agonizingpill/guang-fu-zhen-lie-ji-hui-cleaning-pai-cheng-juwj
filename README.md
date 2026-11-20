@@ -27,7 +27,7 @@ docker compose up -d --build --wait
 
 ## 业务模块与状态
 
-1. **阵列与水量**：ArrayBlock持久化编号、分区、装机、坡度、面积及当前可用水量；分区图是示意图，不是测绘地图。清洗执行中禁止修改阵列规格或配额。
+1. **阵列与水量**：ArrayBlock持久化编号、分区、装机、坡度、面积及当前可用水量；分区图是示意图，不是测绘地图。清洗执行中禁止修改阵列规格或配额；调出与调入阵列的清洗执行中也冻结对应调水扣额/入额。
 2. **巡测与估损**：SoilingSurvey保存辐照、组件温度、无雨日、积灰目测、功率及装机/坡度快照。低于350W/m²禁止评估；评估后不覆盖原输入，修正需新巡测。
 3. **损失优先序**：比较清洁参考功率与实测残差，按损失编制WashMission水量计划。建议水量=面积×0.6×(1+0.1×目测积灰)，单位L。草稿可超量保存作修订依据，但不能派工。
 4. **派工与复测**：主管派工时锁定任务、巡测、阵列行并核验预算与实际余水，扣减水量；mission=dispatched、survey=scheduled、array=washing。派工后水量不可修改。复测保存实际功率与当时辐照，以同辐照归一化计算增益；主管验收正增益后mission=accepted、survey=closed、array=ready并写last_cleaned。同阵列清洗前旧巡测变stale，其草稿任务变superseded，防止用旧积灰读数再次派工。
@@ -65,7 +65,7 @@ Python3.12 / FastAPI / SQLAlchemy / PyMySQL / MySQL8 / Redis7 / scikit-learn1.6 
 
 - backend/src/models.py：三领域实体及审计/账号；schemas.py输入验证；array_routes、survey_routes、mission_routes为领域接口。
 - field_service.py：阵列规格/巡测规则、估损入队；wash_service.py：用水计划/事务派工/复测/验收联动；power_model.py：参考训练与评估；worker.py：估损消费与心跳；scripts/seed_demo.py幂等seed。
-- frontend/src/pages/：阵列图、巡测簿、损失与水量、派工复测及补给/复访六页；components/field.js复用阵列命名、巡测依据、水量账与状态。api.js、store.js、utils.js分离请求、领域状态、格式/时区/错误反馈。
+- frontend/src/pages/：阵列图、巡测簿、损失与水量、派工复测、补给/复访、作业许可、废水、结算与邻阵列调水共十页；components/field.js复用阵列命名、巡测依据、水量账与状态。api.js、store.js、utils.js分离请求、领域状态、格式/时区/错误反馈。
 - 角色、巡测状态、任务状态枚举分别在backend/src/constants.py、frontend/src/constants.js，角色值与账号一致。
 - app.py的trace与recover中间件负责耗时与全局可恢复错误；审计记录真实变更账号/动作/时间。UI显示Asia/Shanghai。
 
@@ -106,3 +106,18 @@ MIT，见LICENSE。
 新增代码按实体、输入约束、路由、许可/废水/结算职责及3个页面组织。历史v1与expansion证据保留，第三轮证据在test-artifacts/gb-1024/v3/。作业许可按日容量预留，不模拟逐分钟班次；本地废水联单不接环保系统，合同凭据不触发收付款。
 
 V3 已知范围补充：每任务一张作业许可；撤销为终止办理，需重新创建任务，当前不支持同任务重办许可。草稿许可可在签发前修订；撤销会释放班组容量。
+
+## 第四轮扩展：邻阵列调水
+
+保留原9页，增加“邻阵列调水”1页，共10个业务页面。调水单 `WaterTransfer` 记录调出/调入阵列、单号、计划升数、调入缺口、水车、发车水量、累计实收、累计退水、损耗及状态 `planned→dispatched→settled`；`WaterTransferReceipt` 按车次登记分次实收，`WaterTransferReturn` 记录撤回凭据。
+
+- **损耗学习与保守判断**：只用 `settled` 调水单的 `loss_liters/dispatched_liters` 学习损耗，`GET /transfers/loss-estimate` 返回样本数、均值、总体标准差与保守损耗率；保守损耗率=均值+离散度，离散度不足1%时按1%留报误差（每车次至少1个百分点的报损误差），上限95%。样本少于3条时不自动估损：发车必须由主管填写预计损耗率（再叠加1%报误差）并写至少5字估量依据。发车按 `发车水量×(1−保守损耗率)` 得保守到水量，不足缺口即拒绝，不因“计划量够”而放行。
+- **发车扣额与并发**：只有主管可发车。发车在事务内 `SELECT … FOR UPDATE` 锁定供水阵列行（与清洗派工共用同一阵列行锁），校验非清洗中、余水足够后一次性扣减；与清洗派工、其他调水并发也不会超扣，扣额失败整笔回滚。发车水量不得超过计划调水量，状态转为 `dispatched`，计划冻结不可修订。
+- **分次收水与拦截**：计划员/主管按车次登记实收，每次入额在锁定调入阵列后加水；`发车量−已实收−已退水` 为当前可收余量，超过即拦下。调入阵列清洗中拒绝入额；单次入额后不得超过阵列100000L上限。车次号在同一调水单唯一且实收水量不可改写。
+- **撤回与结清**：结清前主管可撤回“点清的余水”，不得超过当前可收余量，撤回量加回供水阵列。结清时以 `发车−实收−退水` 计算损耗；若主管提交的损耗数对不上则拒绝，结清后实收、退水、损耗三者与发车量恒等，凭据冻结。结清后不可再收水或撤回。
+- **断线重试**：发车、收水、撤水均支持请求键（`request_key`）；同一键的原样重放直接返回原记录，不重复扣额/入额/退回，水量不一致则拒绝。收水另以 `(transfer_id, seq)` 唯一约束兜底，重复车次不重复入额。
+- **查看去向**：`GET /transfers` 返回每张调水单及其收水、退水明细，页面按车次列出实收量与签收人，可查清每车水的去向；`GET /transfers/{id}/receipts` 单独取车次明细。
+
+接口：`GET/POST /transfers`、`PUT /transfers/{id}`（仅待发车可修订）、`GET /transfers/loss-estimate`、`GET/POST /transfers/{id}/receipts`、`POST /transfers/{id}/dispatch`、`POST /transfers/{id}/return`、`POST /transfers/{id}/settle`。计划员/主管可建单、修订与登记实收；发车、撤回与结清仅主管；观察员只读。业务代码为 `transfer_models.py/transfer_schemas.py/transfer_service.py/transfer_routes.py`，页面为 `pages/transfers.js`。
+
+扩展seed只补缺项：3条历史已结清调水（损耗率5%/6%/7%，用于满足损耗学习样本门槛）和1条待发车调水单 `WT-DEMO-02`（脊线一号→南坡一号，计划600L、缺口520L）。新增3张表，无旧表字段变更。
